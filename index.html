@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Room Map Game</title>
+  <style>
+    :root {
+      --wall-size: 25px; /* tile size used to build walls */
+    }
+    html,body { height: 100%; margin:0; }
+    body {
+      background: #87ceeb;
+      overflow: hidden;
+      font-family: system-ui, Arial, sans-serif;
+    }
+
+    .ground {
+      position: relative;
+      width: 100%;
+      height: 100vh;
+      background-color: #111; /* floor */
+    }
+
+    /* player */
+    .player {
+      position: absolute;
+      width: 50px;
+      height: 50px;
+      border-radius: 7px;
+      background: #ff4500;
+      bottom: 60px;
+      left: 60px;
+      z-index: 30;
+    }
+
+    /* reuse obstacles class name so existing collision helpers work.
+       Each wall tile is 25x25 (var --wall-size) */
+    .obstacles, .wall {
+      position: absolute;
+      width: var(--wall-size);
+      height: var(--wall-size);
+      background: #1f6f1f;
+      border: 1px solid #113d11;
+      box-sizing: border-box;
+      z-index: 40;
+    }
+
+    /* enemy */
+    .enemy {
+      position: absolute;
+      width: 50px;
+      height: 50px;
+      border-radius: 7px;
+      background: #0000ff;
+      z-index: 25;
+    }
+    .enemy.spawned { background: purple; }
+
+    /* boss */
+    .boss {
+      position: absolute;
+      width: 120px;
+      height: 120px;
+      border-radius: 10px;
+      background: #fff;
+      display: none;
+      z-index: 60;
+      transform: translate(-50%,-50%); /* center via left/top */
+      box-shadow: 0 0 12px rgba(255,255,255,0.6) inset;
+    }
+
+    /* shield ring shown around boss while shield active */
+    .boss-shield {
+      position: absolute;
+      width: 220px;
+      height: 220px;
+      border-radius: 50%;
+      border: 8px solid rgba(135,206,235,0.7);
+      pointer-events: none;
+      transform: translate(-50%,-50%);
+      display: none;
+      z-index: 59;
+    }
+
+    /* bullet */
+    .bullet {
+      position: absolute;
+      width: 14px;
+      height: 8px;
+      background: yellow;
+      border-radius: 6px;
+      z-index: 50;
+    }
+
+    /* UI */
+    .ui {
+      position: absolute;
+      top: 10px;
+      right: 12px;
+      color: white;
+      font-weight: bold;
+      z-index: 200;
+    }
+    .map-select {
+      position: absolute;
+      left: 10px;
+      top: 10px;
+      z-index: 200;
+      color: white;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <div class="map-select">
+    <label style="color:white;font-weight:bold">Map:</label>
+    <select id="mapSelect">
+      <option value="1">Map 1</option>
+      <option value="2">Map 2</option>
+      <option value="3">Map 3</option>
+    </select>
+  </div>
+
+  <div class="ui">
+    Kills: <span id="killCount">0</span> &nbsp;|&nbsp; NormalKills: <span id="normalKillCount">0</span>
+  </div>
+
+  <div class="ground" id="ground">
+    <div class="player" id="player"></div>
+    <!-- original enemy in markup (JS will treat first as original) -->
+    <div class="enemy" id="originalEnemy"></div>
+
+    <!-- boss and shield placed inside ground but hidden initially -->
+    <div class="boss" id="boss"></div>
+    <div class="boss-shield" id="bossShield"></div>
+  </div>
+
+<script>
+/* --------------------------
+   Game configuration/state
+   -------------------------- */
+const ground = document.getElementById('ground');
+const player = document.getElementById('player');
+const bossEl = document.getElementById('boss');
+const bossShieldEl = document.getElementById('bossShield');
+
+let killCount = 0;
+let normalKills = 0;
+let bossHp = 50;
+let bossStatus = 'inactive'; // inactive | active | defeated
+let bossShieldActive = false;
+
+const enemyList = []; // entries: { el, original:boolean }
+const MAX_SPAWN_AFTER_BOSS = 4;
+let spawnedAfterBoss = 0;
+let spawnTimer = null;
+
+/* movement */
+const keysPressed = {};
+const PLAYER_STEP = 5;
+let lastDirection = 'right'; // bullet direction
+
+/* tile size used for walls/doors */
+const TILE = 25; // same as CSS var --wall-size
+
+/* Map geometry (will be rebuilt on map select) */
+let mapLayout = null; // filled by createMap(mapId)
+
+/* Utility selectors */
+const q = sel => document.querySelector(sel);
+const id = s => document.getElementById(s);
+
+/* --------------------------
+   Map / room generator
+   --------------------------
+   One big central room + 4 small rooms around it.
+   Rooms are built from wall tiles (size TILE). Each room rectangle
+   is drawn as a ring of wall tiles; doors are holes of width 100px (4 tiles).
+*/
+function createMap(mapId=1) {
+  // clear existing walls
+  document.querySelectorAll('.obstacles').forEach(n => n.remove());
+
+  const W = ground.clientWidth;
+  const H = ground.clientHeight;
+
+  // define central big room size and small room sizes (in px)
+  const centerRoom = {
+    cx: Math.round(W/2),
+    cy: Math.round(H/2),
+    w: Math.round(Math.min(W, H) * 0.5), // half of smaller dimension
+    h: Math.round(Math.min(W, H) * 0.45)
+  };
+
+  const smallW = Math.round(centerRoom.w * 0.45);
+  const smallH = Math.round(centerRoom.h * 0.45);
+  const gap = 100; // door width in px
+
+  // rectangles: format {x, y, w, h} with x,y = center coords
+  const smallRooms = [
+    { cx: centerRoom.cx - centerRoom.w/2 - smallW/2 - 20, cy: centerRoom.cy - centerRoom.h/2 - smallH/2 - 20, w: smallW, h: smallH }, // top-left
+    { cx: centerRoom.cx + centerRoom.w/2 + smallW/2 + 20, cy: centerRoom.cy - centerRoom.h/2 - smallH/2 - 20, w: smallW, h: smallH }, // top-right
+    { cx: centerRoom.cx - centerRoom.w/2 - smallW/2 - 20, cy: centerRoom.cy + centerRoom.h/2 + smallH/2 + 20, w: smallW, h: smallH }, // bottom-left
+    { cx: centerRoom.cx + centerRoom.w/2 + smallW/2 + 20, cy: centerRoom.cy + centerRoom.h/2 + smallH/2 + 20, w: smallW, h: smallH }, // bottom-right
+  ];
+
+  // helper to draw rectangle ring using tiles, leaving door holes where requested
+  function drawRoom(rect, doorDirections=[]) {
+    // rect.x/y are center coords
+    const left = Math.round(rect.cx - rect.w/2);
+    const right = Math.round(rect.cx + rect.w/2);
+    const top = Math.round(rect.cy - rect.h/2);
+    const bottom = Math.round(rect.cy + rect.h/2);
+
+    // create top and bottom horizontal wall tiles
+    for (let x = left; x < right; x += TILE) {
+      // check top
+      const isTopDoor = doorDirections.includes('top') &&
+        (x >= rect.cx - gap/2 && x < rect.cx + gap/2);
+      if (!isTopDoor) createWallTile(x, top);
+      // check bottom
+      const isBottomDoor = doorDirections.includes('bottom') &&
+        (x >= rect.cx - gap/2 && x < rect.cx + gap/2);
+      if (!isBottomDoor) createWallTile(x, bottom - TILE + 1);
+    }
+
+    // create left and right vertical wall tiles
+    for (let y = top; y < bottom; y += TILE) {
+      // left
+      const isLeftDoor = doorDirections.includes('left') &&
+        (y >= rect.cy - gap/2 && y < rect.cy + gap/2);
+      if (!isLeftDoor) createWallTile(left, y);
+      // right
+      const isRightDoor = doorDirections.includes('right') &&
+        (y >= rect.cy - gap/2 && y < rect.cy + gap/2);
+      if (!isRightDoor) createWallTile(right - TILE + 1, y);
+    }
+  }
+
+  function createWallTile(px, py) {
+    const w = document.createElement('div');
+    w.className = 'obstacles'; // reuse existing collision checks (obstacles)
+    w.style.left = Math.round(px) + 'px';
+    w.style.bottom = Math.round(py) + 'px';
+    ground.appendChild(w);
+  }
+
+  // Draw central room with doors to 4 directions
+  drawRoom(centerRoom, ['top','bottom','left','right']);
+
+  // Draw small rooms and give each a door that connects to center:
+  // for top-left: door on right or bottom depending; we'll open door that faces center
+  smallRooms.forEach((sr, idx) => {
+    // determine direction to center
+    const dx = centerRoom.cx - sr.cx;
+    const dy = centerRoom.cy - sr.cy;
+    const dirs = [];
+    if (Math.abs(dx) > Math.abs(dy)) {
+      // horizontally offset: door toward center is left or right
+      dirs.push(dx > 0 ? 'right' : 'left');
+    } else {
+      dirs.push(dy > 0 ? 'bottom' : 'top');
+    }
+    // Also give small room an additional opening toward its adjacent central corridor
+    drawRoom(sr, dirs);
+  });
+
+  // Save map layout centers for spawn logic
+  mapLayout = {
+    centerRoom,
+    smallRooms,
+    W, H
+  };
+}
+
+/* --------------------------
+   Spawn positions helpers
+   -------------------------- */
+function spawnOriginalEnemy() {
+  // treat original element in DOM as original enemy
+  const orig = document.getElementById('originalEnemy');
+  if (!orig) return;
+  orig.classList.remove('spawned');
+  orig.style.left = (mapLayout.centerRoom.cx - 80) + 'px';
+  orig.style.bottom = (mapLayout.centerRoom.cy - 10) + 'px';
+  orig.style.display = 'inline';
+  enemyList.push({ el: orig, original: true });
+}
+
+function spawnAdditionalEnemyAtRandom() {
+  // try to spawn inside one of the small rooms (not inside walls)
+  const rooms = mapLayout.smallRooms;
+  const pick = rooms[Math.floor(Math.random()*rooms.length)];
+  // spawn somewhere inside rect (avoid walls by margin)
+  const margin = 40;
+  const left = Math.max(10, Math.min(mapLayout.W - 60,
+    Math.round(pick.cx - pick.w/2 + margin + Math.random() * (pick.w - margin*2))));
+  const bottom = Math.max(60, Math.min(mapLayout.H - 120,
+    Math.round(pick.cy - pick.h/2 + margin + Math.random() * (pick.h - margin*2))));
+  const el = document.createElement('div');
+  el.className = 'enemy spawned';
+  el.style.left = left + 'px';
+  el.style.bottom = bottom + 'px';
+  ground.appendChild(el);
+  enemyList.push({ el, original: false });
+}
+
+/* --------------------------
+   Boss logic
+   -------------------------- */
+function showBossInCenter() {
+  bossStatus = 'active';
+  bossHp = 50;
+  bossEl.style.display = 'block';
+  // place boss at center
+  const cx = mapLayout.centerRoom.cx;
+  const cy = mapLayout.centerRoom.cy;
+  bossEl.style.left = cx + 'px';
+  bossEl.style.top = (ground.clientHeight - cy) + 'px'; // top positioning because boss is positioned absolute with translate(-50%,-50%)
+  // show shield element around boss
+  bossShieldEl.style.left = cx + 'px';
+  bossShieldEl.style.top = (ground.clientHeight - cy) + 'px';
+  bossShieldEl.style.display = 'block';
+  bossShieldActive = true;
+  // after 5s disable shield
+  setTimeout(() => {
+    bossShieldEl.style.display = 'none';
+    bossShieldActive = false;
+  }, 5000);
+  // start spawning additional enemies after boss spawns
+  startSpawningAfterBoss();
+}
+
+/* Boss collision handling: bullet vs boss */
+function handleBossHit(bullet) {
+  if (bossStatus !== 'active') return false;
+  // bossRect/bulletRect via getBoundingClientRect
+  const br = bossEl.getBoundingClientRect();
+  const brect = bullet.getBoundingClientRect();
+  if (
+    brect.right < br.left || brect.left > br.right ||
+    brect.bottom < br.top || brect.top > br.bottom
+  ) return false;
+
+  // if shield active, bullet removed
+  if (bossShieldActive) {
+    bullet.remove();
+    return true;
+  }
+  // otherwise damage boss
+  bossHp -= 10;
+  bullet.remove();
+  if (bossHp <= 0) {
+    bossEl.style.display = 'none';
+    bossShieldEl.style.display = 'none';
+    bossStatus = 'defeated';
+    stopSpawningAfterBoss();
+  }
+  return true;
+}
+
+/* --------------------------
+   Spawning timer after boss
+   -------------------------- */
+function startSpawningAfterBoss() {
+  if (spawnTimer) return;
+  spawnedAfterBoss = 0;
+  spawnTimer = setInterval(() => {
+    if (spawnedAfterBoss >= MAX_SPAWN_AFTER_BOSS) {
+      stopSpawningAfterBoss();
+      return;
+    }
+    spawnAdditionalEnemyAtRandom();
+    spawnedAfterBoss++;
+  }, 5000);
+}
+function stopSpawningAfterBoss() {
+  if (spawnTimer) {
+    clearInterval(spawnTimer);
+    spawnTimer = null;
+  }
+}
+
+/* --------------------------
+   Movement & collisions
+   -------------------------- */
+function getPlayerPos() {
+  const style = window.getComputedStyle(player);
+  return {
+    left: parseInt(style.left) || 0,
+    bottom: parseInt(style.bottom) || 0
+  };
+}
+
+function willCollideWithWallForPlayer(newLeft, newBottom) {
+  // reuse previous logic: create playerRect and compare to all wall tiles (.obstacles)
+  const playerRect = {
+    left: newLeft,
+    right: newLeft + 50,
+    top: window.innerHeight - (newBottom + 50),
+    bottom: window.innerHeight - newBottom
+  };
+  const walls = document.querySelectorAll('.obstacles');
+  for (const w of walls) {
+    const rect = w.getBoundingClientRect();
+    if (
+      playerRect.left < rect.right &&
+      playerRect.right > rect.left &&
+      playerRect.top < rect.bottom &&
+      playerRect.bottom > rect.top
+    ) return true;
+  }
+  return false;
+}
+
+function willEnemyCollideWithObstacle(nextLeft, nextBottom, enemyEl) {
+  // similar collision but for enemy's 50x50 box
+  const enemyRect = {
+    left: nextLeft,
+    right: nextLeft + 50,
+    top: window.innerHeight - (nextBottom + 50),
+    bottom: window.innerHeight - nextBottom
+  };
+  const walls = document.querySelectorAll('.obstacles');
+  for (const w of walls) {
+    const rect = w.getBoundingClientRect();
+    if (
+      enemyRect.left < rect.right &&
+      enemyRect.right > rect.left &&
+      enemyRect.top < rect.bottom &&
+      enemyRect.bottom > rect.top
+    ) return true;
+  }
+  // screen boundaries
+  if (nextLeft <= 0 || nextLeft >= ground.clientWidth - 50 || nextBottom <= 50 || nextBottom >= ground.clientHeight - 50) return true;
+  return false;
+}
+
+/* Player movement loop */
+function playerLoop() {
+  const pos = getPlayerPos();
+  let newL = pos.left;
+  let newB = pos.bottom;
+  let moved = false;
+  if (keysPressed['ArrowUp']) { newB += PLAYER_STEP; moved = true; lastDirection = 'up'; }
+  if (keysPressed['ArrowDown']) { if (newB > 50) { newB -= PLAYER_STEP; moved = true; lastDirection = 'down'; } }
+  if (keysPressed['ArrowLeft']) { if (newL > 0) { newL -= PLAYER_STEP; moved = true; lastDirection = 'left'; } }
+  if (keysPressed['ArrowRight']) { if (newL < ground.clientWidth - 50) { newL += PLAYER_STEP; moved = true; lastDirection = 'right'; } }
+  if (moved) {
+    const currentlyStuck = willCollideWithWallForPlayer(pos.left, pos.bottom);
+    if (!willCollideWithWallForPlayer(newL, newB) || currentlyStuck) {
+      player.style.left = newL + 'px';
+      player.style.bottom = newB + 'px';
+    }
+  }
+  requestAnimationFrame(playerLoop);
+}
+requestAnimationFrame(playerLoop);
+
+/* Enemy movement: each enemy moves trying to go toward player but avoids walls */
+function moveAllEnemies() {
+  for (const obj of enemyList) {
+    const el = obj.el;
+    if (!el || el.style.display === 'none') continue;
+    let left = parseFloat(el.style.left) || 10;
+    let bottom = parseFloat(el.style.bottom) || 100;
+
+    // decide direction toward player
+    const p = getPlayerPos();
+    const dx = p.left - left;
+    const dy = p.bottom - bottom;
+
+    // pick primary axis
+    let dirs = [];
+    if (Math.abs(dx) > Math.abs(dy)) {
+      if (dx > 0) dirs.push('r'); else dirs.push('l');
+      if (dy > 0) dirs.push('u'); else dirs.push('d');
+    } else {
+      if (dy > 0) dirs.push('u'); else dirs.push('d');
+      if (dx > 0) dirs.push('r'); else dirs.push('l');
+    }
+
+    let moved = false;
+    function tryMove(dir) {
+      let nl = left, nb = bottom;
+      const step = 8;
+      if (dir === 'r') nl += step;
+      if (dir === 'l') nl -= step;
+      if (dir === 'u') nb += step;
+      if (dir === 'd') nb -= step;
+      nl = Math.max(10, Math.min(ground.clientWidth - 60, nl));
+      nb = Math.max(60, Math.min(ground.clientHeight - 60, nb));
+      if (!willEnemyCollideWithObstacle(nl, nb, el)) {
+        el.style.left = nl + 'px';
+        el.style.bottom = nb + 'px';
+        return true;
+      }
+      return false;
+    }
+
+    for (let i=0;i<dirs.length;i++) {
+      if (tryMove(dirs[i])) { moved = true; break; }
+    }
+    if (!moved) {
+      // try random directions
+      const all = ['r','l','u','d'];
+      for (let i=0;i<4;i++) {
+        const j = Math.floor(Math.random()*all.length);
+        if (tryMove(all[j])) break;
+      }
+    }
+  }
+  setTimeout(moveAllEnemies, 220);
+}
+setTimeout(moveAllEnemies, 220);
+
+/* Enemy shooting: check alignment, shoot toward player */
+setInterval(() => {
+  const p = getPlayerPos();
+  for (const obj of enemyList) {
+    const e = obj.el;
+    if (!e || e.style.display === 'none') continue;
+    const el = parseFloat(e.style.left) || 0;
+    const eb = parseFloat(e.style.bottom) || 0;
+    const er = el + 50;
+    const et = eb + 50;
+    const verticalOverlap = p.left < er && (p.left+50) > el;
+    const horizontalOverlap = p.bottom < et && (p.bottom+50) > eb;
+    if (verticalOverlap) {
+      if (p.bottom+50 < eb) shootEnemyBullet('down', e);
+      else if (p.bottom > et) shootEnemyBullet('up', e);
+    } else if (horizontalOverlap) {
+      if (p.left > er) shootEnemyBullet('right', e);
+      else if (p.left+50 < el) shootEnemyBullet('left', e);
+    }
+  }
+}, 900);
+
+/* --------------------------
+   Bullets: player & enemy
+   -------------------------- */
+function shootPlayerBullet() {
+  const pos = getPlayerPos();
+  const b = document.createElement('div');
+  b.className = 'bullet';
+  b.style.left = pos.left + 25 - 7 + 'px';
+  b.style.bottom = pos.bottom + 25 - 4 + 'px';
+  b.dataset.dir = lastDirection;
+  ground.appendChild(b);
+  movePlayerBullet(b);
+}
+
+function movePlayerBullet(bullet) {
+  const dir = bullet.dataset.dir || 'right';
+  function step() {
+    if (!document.body.contains(bullet)) return;
+    let left = parseFloat(bullet.style.left) || 0;
+    let bottom = parseFloat(bullet.style.bottom) || 0;
+    const speed = 12;
+    if (dir === 'right') left += speed;
+    else if (dir === 'left') left -= speed;
+    else if (dir === 'up') bottom += speed;
+    else if (dir === 'down') bottom -= speed;
+
+    bullet.style.left = left + 'px';
+    bullet.style.bottom = bottom + 'px';
+
+    // out of bounds
+    if (left < -50 || left > ground.clientWidth+50 || bottom < -50 || bottom > ground.clientHeight+50) {
+      bullet.remove();
+      return;
+    }
+
+    // collision with walls
+    if (bulletHitsWall(bullet)) { bullet.remove(); return; }
+
+    // boss first
+    if (handleBossHit(bullet)) { return; }
+
+    // enemies
+    if (bulletHitsEnemy(bullet)) { return; }
+
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+function shootEnemyBullet(direction, enemyEl) {
+  if (!enemyEl || enemyEl.style.display === 'none') return;
+  const left = parseFloat(enemyEl.style.left) || 0;
+  const bottom = parseFloat(enemyEl.style.bottom) || 0;
+  const b = document.createElement('div');
+  b.className = 'bullet';
+  b.style.left = left + 25 - 7 + 'px';
+  b.style.bottom = bottom + 25 - 4 + 'px';
+  b.dataset.dir = direction;
+  b.dataset.enemy = '1';
+  ground.appendChild(b);
+  moveEnemyBullet(b);
+}
+
+function moveEnemyBullet(bullet) {
+  const dir = bullet.dataset.dir || 'left';
+  function step() {
+    if (!document.body.contains(bullet)) return;
+    let left = parseFloat(bullet.style.left) || 0;
+    let bottom = parseFloat(bullet.style.bottom) || 0;
+    const speed = 6;
+    if (dir === 'right') left += speed;
+    else if (dir === 'left') left -= speed;
+    else if (dir === 'up') bottom += speed;
+    else if (dir === 'down') bottom -= speed;
+
+    bullet.style.left = left + 'px';
+    bullet.style.bottom = bottom + 'px';
+
+    if (left < -50 || left > ground.clientWidth+50 || bottom < -50 || bottom > ground.clientHeight+50) {
+      bullet.remove();
+      return;
+    }
+    if (bulletHitsWall(bullet)) { bullet.remove(); return; }
+    if (enemyBulletHitsPlayer(bullet)) { bullet.remove(); return; }
+
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+/* bullet-wall collision */
+function bulletHitsWall(bullet) {
+  const brect = bullet.getBoundingClientRect();
+  const walls = document.querySelectorAll('.obstacles');
+  for (const w of walls) {
+    const r = w.getBoundingClientRect();
+    if (brect.left < r.right && brect.right > r.left && brect.top < r.bottom && brect.bottom > r.top) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* bullet-enemy collision: removes both bullet & enemy and updates counters */
+function bulletHitsEnemy(bullet) {
+  for (const obj of enemyList) {
+    const e = obj.el;
+    if (!e || e.style.display === 'none') continue;
+    const brect = bullet.getBoundingClientRect();
+    const erect = e.getBoundingClientRect();
+    if (brect.left < erect.right && brect.right > erect.left && brect.top < erect.bottom && brect.bottom > erect.top) {
+      // hit
+      bullet.remove();
+      e.style.display = 'none';
+      killCount++;
+      id('killCount').innerText = killCount;
+
+      if (obj.original) {
+        normalKills++;
+        id('normalKillCount').innerText = normalKills;
+        // if normalKills hit 5 -> spawn boss
+        if (normalKills >= 5 && bossStatus !== 'active' && bossStatus !== 'defeated') {
+          showBossInCenter();
+          // do not respawn original
+        } else {
+          // respawn original after 1s if boss not active
+          setTimeout(() => {
+            if (bossStatus === 'inactive') {
+              e.style.left = (mapLayout.centerRoom.cx - 80) + 'px';
+              e.style.bottom = (mapLayout.centerRoom.cy - 10) + 'px';
+              e.style.display = 'inline';
+            }
+          }, 1000);
+        }
+      } else {
+        // spawned enemies do NOT auto-respawn per your choice
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+/* enemy bullet hits player */
+function enemyBulletHitsPlayer(bullet) {
+  const pres = player.getBoundingClientRect();
+  const brect = bullet.getBoundingClientRect();
+  if (brect.left < pres.right && brect.right > pres.left && brect.top < pres.bottom && brect.bottom > pres.top) {
+    alert('Game Over! You were shot.');
+    player.style.left = '60px';
+    player.style.bottom = '60px';
+    return true;
+  }
+  return false;
+}
+
+/* --------------------------
+   Input handlers
+   -------------------------- */
+document.addEventListener('keydown', (e) => {
+  keysPressed[e.key] = true;
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)) {
+    e.preventDefault();
+    lastDirection = e.key === 'ArrowLeft' ? 'left' : e.key === 'ArrowRight' ? 'right' : e.key === 'ArrowUp' ? 'up' : 'down';
+  }
+  if (e.key === ' ') {
+    e.preventDefault();
+    shootPlayerBullet();
+  }
+});
+document.addEventListener('keyup', (e) => { keysPressed[e.key] = false; });
+
+/* --------------------------
+   Helper: enemy shooting wrapper
+   -------------------------- */
+function shootEnemyBullet(dir, enemyEl) {
+  shootEnemyBulletOriginal(dir, enemyEl);
+}
+function shootEnemyBulletOriginal(direction, enemy) {
+  if (!enemy || enemy.style.display === 'none') return;
+  shootEnemyBullet(direction, enemy);
+}
+
+/* --------------------------
+   Start / init logic
+   -------------------------- */
+function resetGame() {
+  // build map
+  createMap(1);
+  // clear existing enemies array and DOM spawned enemies (excluding original)
+  enemyList.length = 0;
+  document.querySelectorAll('.enemy.spawned').forEach(n => n.remove());
+
+  // original enemy element
+  const orig = document.getElementById('originalEnemy');
+  if (orig) {
+    orig.style.display = 'inline';
+    orig.style.left = (mapLayout.centerRoom.cx - 80) + 'px';
+    orig.style.bottom = (mapLayout.centerRoom.cy - 10) + 'px';
+    orig.classList.remove('spawned');
+    enemyList.push({ el: orig, original: true });
+  }
+
+  // boss hidden
+  bossEl.style.display = 'none';
+  bossShieldEl.style.display = 'none';
+  bossStatus = 'inactive';
+  bossShieldActive = false;
+  bossHp = 50;
+
+  // reset counters
+  killCount = 0;
+  normalKills = 0;
+  spawnedAfterBoss = 0;
+  id('killCount').innerText = killCount;
+  id('normalKillCount').innerText = normalKills;
+  stopSpawningAfterBoss();
+}
+
+// handle map select change
+id('mapSelect').addEventListener('change', (e) => {
+  resetGame();
+});
+
+// initial setup
+window.addEventListener('load', () => {
+  // initial map and game
+  resetGame();
+});
+
+/* Small polyfills to avoid function name clash from earlier code */
+function shootEnemyBullet(dir, enemyEl) {
+  // wrapper to avoid redefinition confusion: create a bullet & move it
+  if (!enemyEl || enemyEl.style.display === 'none') return;
+  const left = parseFloat(enemyEl.style.left) || 0;
+  const bottom = parseFloat(enemyEl.style.bottom) || 0;
+  const b = document.createElement('div');
+  b.className = 'bullet';
+  b.style.left = left + 25 - 7 + 'px';
+  b.style.bottom = bottom + 25 - 4 + 'px';
+  b.dataset.dir = dir;
+  ground.appendChild(b);
+  moveEnemyBullet(b);
+}
+
+/* End of code */
+</script>
+</body>
+</html>
